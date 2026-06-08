@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Micro Contra - 環境干擾與橫向捲軸版</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #111;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: 'Arial', sans-serif;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #gameWrapper {
+            position: relative;
+        }
+        canvas {
+            border: 4px solid #fff;
+            background-color: #070714;
+            box-shadow: 0 0 35px rgba(231, 76, 60, 0.4);
+            transition: transform 0.05s linear; /* 用於實現螢幕震動視覺效果 */
+        }
+        .instructions {
+            margin-top: 15px;
+            text-align: center;
+            line-height: 1.6;
+        }
+        span {
+            background: #333;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #555;
+            color: #f1c40f;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="gameWrapper">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+    </div>
+
+    <div class="instructions">
+        <h3>🏃‍♂️ 終極指令：抵抗地震並向前推進地圖，迎擊魔王！</h3>
+        <p>控制：<span>A</span> / <span>D</span> 移動 ｜ 跳躍：<span>Space</span> ｜ 單發射擊：<span>J</span>（不可連按）</p>
+        <p>⚠️ 機制：彈匣僅 <span>5發</span>，打光自動換彈 (1.5秒) ｜ 地面會<span>左右搖晃</span>干擾走位，請努力<span>向右前進</span>！</p>
+    </div>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+const GROUND_Y = canvas.height - 100;
+const keys = {};
+let canShoot = true; // 用於防止連按的旗標
+
+// --- 捲軸與地圖進度設定 ---
+let cameraX = 0;             // 鏡頭目前在世界地圖的 X 位置
+const WORLD_WIDTH = 2000;    // 關卡總長度
+let plotTriggered = false;   // 魔王劇情是否觸發
+
+// --- 地面搖晃（地震）變數 ---
+let shakeTimer = 0;
+let shakeForce = 0;          // 當前對玩家施加的物理推力
+let visualShakeX = 0;        // 畫布視覺上的抖動偏移
+
+// --- 遊戲狀態 ---
+let score = 0;
+let gameState = "PLAYING"; 
+let spawnTimer = 0;
+let bossActive = false;
+
+// --- 武器/彈藥系統 ---
+const ammoSystem = {
+    maxAmmo: 5,
+    currentAmmo: 5,
+    isReloading: false,
+    reloadTimer: 0,
+    reloadTimeFrames: 90 // 1.5 秒 (60FPS * 1.5)
+};
+
+// --- 世界地形與障礙物（採用絕對世界座標） ---
+const worldHazards = [
+    { x: 1200, y: GROUND_Y - 5, width: 250, height: 15 } // 岩漿池藏在 1200px 處
+];
+
+const worldPlatforms = [
+    { x: 400, y: GROUND_Y - 120, width: 160, height: 15 },
+    { x: 750, y: GROUND_Y - 160, width: 160, height: 15 },
+    { x: 1100, y: GROUND_Y - 120, width: 160, height: 15 }, // 跨越岩漿的左高台
+    { x: 1350, y: GROUND_Y - 120, width: 160, height: 15 }  // 跨越岩漿的右高台
+];
+
+// --- 1. 玩家物件 (在世界座標中運動) ---
+const player = {
+    worldX: 100, // 在虛擬大地圖上的實際位置
+    y: GROUND_Y - 60,
+    width: 35,
+    height: 55,
+    speedX: 5,
+    velY: 0,
+    jumpPower: -15,
+    gravity: 0.8,
+    isJumping: false,
+    direction: 1,
+
+    update() {
+        // A/D 基礎移動
+        let moveIntent = 0;
+        if (keys['a'] || keys['a']) { moveIntent -= this.speedX; this.direction = -1; }
+        if (keys['d'] || keys['d']) { moveIntent += this.speedX; this.direction = 1; }
+
+        // 加上環境左右搖晃的推力干擾
+        this.worldX += moveIntent + shakeForce;
+
+        // 重力與平台判定
+        this.velY += this.gravity;
+        this.y += this.velY;
+
+        let onPlatform = false;
+        for (let plat of worldPlatforms) {
+            if (this.worldX + this.width > plat.x && this.worldX < plat.x + plat.width) {
+                if (this.velY >= 0 && this.y + this.height <= plat.y + 10 && this.y + this.height + this.velY >= plat.y) {
+                    this.y = plat.y - this.height;
+                    this.velY = 0;
+                    this.isJumping = false;
+                    onPlatform = true;
+                    break;
+                }
+            }
+        }
+
+        if (!onPlatform && this.y + this.height >= GROUND_Y) {
+            this.y = GROUND_Y - this.height;
+            this.velY = 0;
+            this.isJumping = false;
+        }
+
+        // 限制世界地圖邊界
+        if (this.worldX < 0) this.worldX = 0;
+        
+        // 如果魔王沒死，玩家無法走出地圖最右端
+        if (this.worldX + this.width > WORLD_WIDTH) this.worldX = WORLD_WIDTH - this.width;
+
+        // 鏡頭捲軸控制：當玩家走過螢幕中線，且鏡頭還沒到底，鏡頭跟隨
+        if (this.worldX > canvas.width / 2) {
+            cameraX = this.worldX - canvas.width / 2;
+            if (cameraX > WORLD_WIDTH - canvas.width) {
+                cameraX = WORLD_WIDTH - canvas.width;
+            }
+        } else {
+            cameraX = 0;
+        }
+
+        // 檢查岩漿死亡判定
+        for (let hz of worldHazards) {
+            if (this.worldX + this.width > hz.x && this.worldX < hz.x + hz.width && this.y + this.height >= GROUND_Y - 5) {
+                gameState = "GAMEOVER";
+            }
+        }
+    },
+    jump() {
+        if (!this.isJumping || this.velY === 0) { 
+            this.velY = this.jumpPower; 
+            this.isJumping = true; 
+        }
+    },
+    shoot() {
+        // 彈藥檢查與防連按機制
+        if (ammoSystem.isReloading || ammoSystem.currentAmmo <= 0) return;
+
+        ammoSystem.currentAmmo--;
+        
+        // 子彈發射（世界座標）
+        bullets.push({
+            worldX: this.direction === 1 ? this.worldX + this.width : this.worldX,
+            y: this.y + 18,
+            width: 14,
+            height: 6,
+            speedX: 12 * this.direction,
+            speedY: 0,
+            type: "player",
+            color: "#f1c40f"
+        });
+
+        // 觸發自動自動填彈
+        if (ammoSystem.currentAmmo === 0) {
+            ammoSystem.isReloading = true;
+            ammoSystem.reloadTimer = 0;
+        }
+    },
+    draw() {
+        // 將世界座標換算為螢幕顯示座標： screenX = worldX - cameraX
+        let screenX = this.worldX - cameraX;
+        ctx.fillStyle = "#3498db"; 
+        ctx.fillRect(screenX, this.y, this.width, this.height);
+        ctx.fillStyle = "#fff";
+        let eyeX = this.direction === 1 ? screenX + 22 : screenX + 5;
+        ctx.fillRect(eyeX, this.y + 10, 8, 8);
+    }
+};
+
+// --- 2. 大魔王物件 ---
+const boss = {
+    worldX: WORLD_WIDTH - 160, // 固定在世界地圖的最深處
+    y: GROUND_Y - 160,
+    width: 110,
+    height: 160,
+    hp: 15,
+    maxHp: 15,
+    speedY: 1.5,
+    skillTimer: 0,
+    currentSkillText: "正在等待愚蠢的人類...",
+
+    update() {
+        if (!bossActive) return;
+
+        this.y += this.speedY;
+        if (this.y <= GROUND_Y - 220 || this.y >= GROUND_Y - 160) {
+            this.speedY *= -1;
+        }
+
+        this.skillTimer++;
+        if (this.skillTimer >= 90) {
+            this.useRandomSkill();
+            this.skillTimer = 0;
+        }
+    },
+    useRandomSkill() {
+        const r = Math.random();
+        if (r < 0.4) {
+            this.currentSkillText = "波次：異星連擊火球！";
+            for(let i=0; i<3; i++) {
+                setTimeout(() => {
+                    if (gameState !== "PLAYING") return;
+                    bullets.push({
+                        worldX: this.worldX,
+                        y: this.y + 30 + (i * 40),
+                        width: 18,
+                        height: 18,
+                        speedX: -8,
+                        speedY: 0,
+                        type: "boss",
+                        color: "#e74c3c",
+                        shape: "circle"
+                    });
+                }, i * 200);
+            }
+        } else {
+            this.currentSkillText = "大招：湮滅震地波！(快跳上高台！)";
+            bullets.push({
+                worldX: this.worldX - 20,
+                y: GROUND_Y - 80,
+                width: 50,
+                height: 80,
+                speedX: -6,
+                speedY: 0,
+                type: "boss",
+                color: "#e67e22",
+                shape: "rect"
+            });
+        }
+    },
+    draw() {
+        let screenX = this.worldX - cameraX;
+        ctx.fillStyle = "#9b59b6"; 
+        ctx.fillRect(screenX, this.y, this.width, this.height);
+        ctx.fillStyle = "#e74c3c"; 
+        ctx.fillRect(screenX + 15, this.y + 35, 30, 30);
+
+        // 魔王血條
+        const barWidth = 400;
+        const barX = (canvas.width - barWidth) / 2;
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(barX, 25, barWidth, 16);
+        ctx.fillStyle = "#e74c3c";
+        ctx.fillRect(barX, 25, (this.hp / this.maxHp) * barWidth, 16);
+
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 14px Arial";
+        ctx.fillText(`🚨 FINAL BOSS: 異星暴君 (${this.currentSkillText})`, barX, 18);
+    }
+};
+
+let bullets = [];
+let enemies = [];
+
+// --- 邏輯輔助函式 ---
+
+function spawnEnemy() {
+    if (bossActive) return;
+    // 敵人在螢幕右端外面一點點生成
+    enemies.push({
+        worldX: cameraX + canvas.width + 20,
+        y: GROUND_Y - 55,
+        width: 35,
+        height: 55,
+        speed: 3
+    });
+}
+
+function isColliding(rect1, rect2) {
+    // 統一使用世界座標系統做邏輯碰撞判定
+    let r1X = rect1.worldX !== undefined ? rect1.worldX : rect1.x;
+    let r2X = rect2.worldX !== undefined ? rect2.worldX : rect2.x;
+    return r1X < r2X + rect2.width &&
+           r1X + rect1.width > r2X &&
+           rect1.y < rect2.y + rect2.height &&
+           rect1.y + rect1.height > rect2.y;
+}
+
+function resetGame() {
+    player.worldX = 100;
+    player.y = GROUND_Y - 60;
+    player.velY = 0;
+    cameraX = 0;
+    bullets = [];
+    enemies = [];
+    score = 0;
+    bossActive = false;
+    plotTriggered = false;
+    boss.hp = boss.maxHp;
+    boss.skillTimer = 0;
+    boss.currentSkillText = "正在等待愚蠢的人類...";
+    ammoSystem.currentAmmo = ammoSystem.maxAmmo;
+    ammoSystem.isReloading = false;
+    gameState = "PLAYING";
+}
+
+// --- 監聽按鍵與單發射擊鎖定 ---
+window.addEventListener("keydown", (e) => {
+    if (keys[e.key]) return; // 如果這個按鍵已經被按著，直接無視 (防止長按連發)
+    keys[e.key] = true;
+
+    if (gameState === "PLAYING") {
+        if (e.key === " ") player.jump();
+        
+        // 限制必須放開再按，且必須有 canShoot 旗標才射擊
+        if ((e.key === "j" || e.key === "J") && canShoot) { 
+            player.shoot(); 
+            canShoot = false; // 鎖定射擊，直到玩家鬆開按鍵
+        }
+    } else {
+        if (e.key === "r" || e.key === "R") resetGame();
+    }
+});
+
+window.addEventListener("keyup", (e) => {
+    keys[e.key] = false;
+    if (e.key === "j" || e.key === "J") {
+        canShoot = true; // 玩家鬆開 J 鍵，解鎖下一次射擊權
+    }
+});
+
+// --- 主循環 ---
+function gameLoop() {
+    // 處理填彈計時
+    if (ammoSystem.isReloading) {
+        ammoSystem.reloadTimer++;
+        if (ammoSystem.reloadTimer >= ammoSystem.reloadTimeFrames) {
+            ammoSystem.currentAmmo = ammoSystem.maxAmmo;
+            ammoSystem.isReloading = false;
+        }
+    }
+
+    // 環境干擾：地震搖晃物理學計算 (使用正弦函數模擬左右規律擺動)
+    shakeTimer += 0.05;
+    shakeForce = Math.sin(shakeTimer) * 2.5;     // 施加在玩家位移上的物理力
+    visualShakeX = Math.sin(shakeTimer * 2) * 4; // 視覺畫布的微幅抖動
+
+    // 將視覺抖動套用到 HTML Canvas 上
+    canvas.style.transform = `translateX(${visualShakeX}px)`;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // --- 繪製捲軸地圖環境 ---
+    // 1. 繪製安全地面
+    ctx.strokeStyle = "#2ecc71";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(canvas.width, GROUND_Y);
+    ctx.stroke();
+
+    // 2. 繪製世界岩漿池 (換算為螢幕座標)
+    for (let hz of worldHazards) {
+        let scrX = hz.x - cameraX;
+        ctx.fillStyle = "#e74c3c";
+        ctx.fillRect(scrX, hz.y, hz.width, hz.height);
+    }
+
+    // 3. 繪製世界浮空高台 (換算為螢幕座標)
+    ctx.fillStyle = "#27ae60";
+    for (let plat of worldPlatforms) {
+        let scrX = plat.x - cameraX;
+        ctx.fillRect(scrX, plat.y, plat.width, plat.height);
+    }
+
+    // --- 遊戲核心更新邏輯 ---
+    if (gameState === "PLAYING") {
+        player.update();
+
+        // 劇情推進條件：玩家在世界地圖前進超過 1000 像素，觸發大魔王現身劇情
+        if (player.worldX >= 1000 && !plotTriggered) {
+            plotTriggered = true;
+            bossActive = true;
+        }
+
+        // 小兵生成機制
+        if (!bossActive) {
+            spawnTimer++;
+            if (spawnTimer >= 70) { spawnEnemy(); spawnTimer = 0; }
+        } else {
+            boss.update();
+            if (isColliding(player, boss)) gameState = "GAMEOVER";
+        }
+
+        // 子彈邏輯
+        for (let i = bullets.length - 1; i >= 0; i--) {
+            let b = bullets[i];
+            b.worldX += b.speedX;
+            b.y += b.speedY;
+
+            let scrX = b.worldX - cameraX;
+
+            // 繪製子彈
+            ctx.fillStyle = b.color;
+            if (b.shape === "circle") {
+                ctx.beginPath();
+                ctx.arc(scrX + b.width/2, b.y + b.height/2, b.width/2, 0, Math.PI * 2);
+                ctx.fill();
+            } else {
+                ctx.fillRect(scrX, b.y, b.width, b.height);
+            }
+
+            // 碰撞檢查
+            if (b.type === "player") {
+                // 打小兵
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    if (isColliding(b, enemies[j])) {
+                        enemies.splice(j, 1);
+                        bullets.splice(i, 1);
+                        score += 20;
+                        break;
+                    }
+                }
+                // 打魔王
+                if (bossActive && bullets[i] && isColliding(b, boss)) {
+                    boss.hp--;
+                    bullets.splice(i, 1);
+                    if (boss.hp <= 0) gameState = "WIN";
+                    continue;
+                }
+            } else {
+                if (isColliding(b, player)) gameState = "GAMEOVER";
+            }
+
+            // 出界刪除
+            if (scrX > canvas.width + 100 || scrX < -100) {
+                bullets.splice(i, 1);
+            }
+        }
+
+        // 小兵邏輯
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            enemies[i].worldX -= enemies[i].speed;
+            let scrX = enemies[i].worldX - cameraX;
+
+            ctx.fillStyle = "#d35400"; 
+            ctx.fillRect(scrX, enemies[i].y, enemies[i].width, enemies[i].height);
+
+            if (isColliding(player, enemies[i])) gameState = "GAMEOVER";
+            if (scrX + enemies[i].width < 0) enemies.splice(i, 1);
+        }
+    }
+
+    // 渲染角色與魔王
+    player.draw();
+    if (bossActive) boss.draw();
+
+    // --- 頂部常駐 UI 渲染 ---
+    ctx.fillStyle = "#fff";
+    ctx.font = "16px Arial";
+    // 1. 關卡進度與劇情推進狀態
+    if (!bossActive) {
+        let progress = Math.min(100, Math.floor((player.worldX / 1000) * 100));
+        ctx.fillText(`🎬 劇情推進進度: ${progress}% (請向右前進引發最終決戰)`, 20, 35);
+    }
+    // 2. 顯示彈藥狀態
+    ctx.font = "bold 16px Arial";
+    if (ammoSystem.isReloading) {
+        ctx.fillStyle = "#e74c3c";
+        ctx.fillText("🔋 RELOADING...", 20, 65);
+    } else {
+        ctx.fillStyle = "#f1c40f";
+        ctx.fillText(`💥 彈藥: ${ammoSystem.currentAmmo} / ${ammoSystem.maxAmmo} [J鍵單發]`, 20, 65);
+    }
+
+    // 遊戲結束與勝利畫面
+    if (gameState === "GAMEOVER") {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#e74c3c";
+        ctx.font = "bold 45px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText("MISSION FAILED", canvas.width / 2, canvas.height / 2 - 20);
+        ctx.fillStyle = "#fff";
+        ctx.font = "20px Arial";
+        ctx.fillText("Press 'R' to Restart", canvas.width / 2, canvas.height / 2 + 30);
+        ctx.textAlign = "left";
+    }
+
+    if (gameState === "WIN") {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#2ecc71";
+        ctx.font = "bold 45px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText("VICTORY!", canvas.width / 2, canvas.height / 2 - 20);
+        ctx.fillStyle = "#f1c40f";
+        ctx.font = "22px Arial";
+        ctx.fillText("你克服了強震與彈藥限制，成功完成斬首行動！", canvas.width / 2, canvas.height / 2 + 30);
+        ctx.textAlign = "left";
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+
+</body>
+</html>
