@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Micro Contra - 戰役劇情與場景變換版</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #050505;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: 'Courier New', monospace, sans-serif;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #gameWrapper {
+            position: relative;
+        }
+        canvas {
+            border: 4px solid #fff;
+            box-shadow: 0 0 35px rgba(0, 0, 0, 0.8);
+            transition: transform 0.05s linear;
+        }
+        .instructions {
+            margin-top: 15px;
+            text-align: center;
+            line-height: 1.6;
+        }
+        span {
+            background: #222;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #444;
+            color: #f1c40f;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="gameWrapper">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+    </div>
+
+    <div class="instructions">
+        <h3>🎬 指令：抵抗晃動並向前步行，突破三個場景推進戰役劇情！</h3>
+        <p>控制：<span>A</span> / <span>D</span> 移動 ｜ 跳躍：<span>Space</span> ｜ 單發射擊：<span>J</span>（不可連按）</p>
+        <p>💬 劇情對話播放時，按下 <span>Enter</span> 鍵可以繼續推進對話或開始關卡。</p>
+    </div>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+const GROUND_Y = canvas.height - 100;
+const keys = {};
+let canShoot = true;
+
+// --- 捲軸與地圖總長設定 ---
+let cameraX = 0;
+const WORLD_WIDTH = 3000; // 地圖再度拉長，容納三個大場景
+
+// --- 地面搖晃（地震）變數 ---
+let shakeTimer = 0;
+let shakeForce = 0;
+let visualShakeX = 0;
+
+// --- 劇情與對話系統變數 ---
+let isCutscene = true; // 一開始先進入開場劇情
+let currentDialogueIndex = 0;
+let dialogueList = [];
+
+// --- 關卡與場景定義 ---
+let currentStage = 1; // 1: 基地, 2: 森林, 3: 核心魔王戰
+const stageConfigs = {
+    1: { name: "STAGE 1: 廢棄軍事基地", bgColor: "#0b132b", groundColor: "#5c677d", platColor: "#4a4e69", hazardColor: "#e63946" },
+    2: { name: "STAGE 2: 異星病毒森林", bgColor: "#132a13", groundColor: "#3f5e30", platColor: "#606c38", hazardColor: "#70e000" }, // 綠色毒漿
+    3: { name: "STAGE 3: 最終異星核心", bgColor: "#2b0f1a", groundColor: "#9d0208", platColor: "#6a040f", hazardColor: "#faa307" }
+};
+
+// --- 彈藥系統 ---
+const ammoSystem = {
+    maxAmmo: 5,
+    currentAmmo: 5,
+    isReloading: false,
+    reloadTimer: 0,
+    reloadTimeFrames: 90
+};
+
+// --- 虛擬世界大地圖的地形配置 (世界座標) ---
+const worldHazards = [
+    { x: 600, y: GROUND_Y - 5, width: 120, height: 15 },  // 階段 1 的坑
+    { x: 1400, y: GROUND_Y - 5, width: 250, height: 15 }, // 階段 2 的毒池
+    { x: 1750, y: GROUND_Y - 5, width: 150, height: 15 }, 
+    { x: 2300, y: GROUND_Y - 5, width: 300, height: 15 }  // 階段 3 魔王前的大岩漿
+];
+
+const worldPlatforms = [
+    // 基地高台
+    { x: 300, y: GROUND_Y - 120, width: 150, height: 15 },
+    { x: 550, y: GROUND_Y - 160, width: 180, height: 15 },
+    // 森林高台
+    { x: 1100, y: GROUND_Y - 100, width: 150, height: 15 },
+    { x: 1350, y: GROUND_Y - 180, width: 160, height: 15 },
+    { x: 1600, y: GROUND_Y - 100, width: 150, height: 15 },
+    // 核心高台
+    { x: 2100, y: GROUND_Y - 120, width: 140, height: 15 },
+    { x: 2280, y: GROUND_Y - 180, width: 160, height: 15 },
+    { x: 2480, y: GROUND_Y - 120, width: 140, height: 15 }
+];
+
+// --- 劇本文本定義定義 ---
+const dialogues = {
+    start: [
+        { speaker: "總部無線電", text: "「雷霆上尉！你已成功潛入被佔領的廢棄基地。」" },
+        { speaker: "總部無線電", text: "「感測到地底能量極度不穩，地表隨時會產生劇烈搖晃！」" },
+        { speaker: "雷霆上尉", text: "「收到。晃動阻止不了我，我會一路向右突圍，直取異星核心！」" },
+        { speaker: "系統提示", text: "【按 Enter 鍵正式開戰，前進突破第一階段】" }
+    ],
+    forest: [
+        { speaker: "雷霆上尉", text: "「前方植物全部枯萎了...空氣中有股刺鼻的酸味。」" },
+        { speaker: "總部無線電", text: "「糟糕！你已進入異星生物改造的『病毒森林』！」" },
+        { speaker: "總部無線電", text: "「注意地表的綠色積水，那是具有強烈腐蝕性的劇毒酸泥！」" },
+        { speaker: "雷霆上尉", text: "「了解，利用懸浮高台跨過去就行了。出發！」" },
+        { speaker: "系統提示", text: "【按 Enter 鍵繼續，進入第二關：病毒森林】" }
+    ],
+    boss: [
+        { speaker: "雷霆上尉", text: "「周圍的牆壁居然在像心臟一樣跳動...我到了。」" },
+        { speaker: "？？？", text: "「愚蠢的碳基生物...竟敢獨自闖入神聖的核心主體。」" },
+        { speaker: "異星暴君", text: "「地面的震動是我毀滅你們行星的交響樂！受死吧！」" },
+        { speaker: "雷霆上尉", text: "「廢話少說，亮出你的血條吧！」" },
+        { speaker: "系統提示", text: "【按 Enter 鍵觸發最終決戰！擊敗異星暴君！】" }
+    ]
+};
+
+// 觸發對話劇情的函式
+function triggerCutscene(type) {
+    isCutscene = true;
+    currentDialogueIndex = 0;
+    dialogueList = dialogues[type];
+}
+
+// --- 1. 玩家物件 ---
+const player = {
+    worldX: 60,
+    y: GROUND_Y - 60,
+    width: 35,
+    height: 55,
+    speedX: 5,
+    velY: 0,
+    jumpPower: -15,
+    gravity: 0.8,
+    isJumping: false,
+    direction: 1,
+
+    update() {
+        if (isCutscene) return; // 劇情時間禁止操作
+
+        let moveIntent = 0;
+        if (keys['a'] || keys['A']) { moveIntent -= this.speedX; this.direction = -1; }
+        if (keys['d'] || keys['D']) { moveIntent += this.speedX; this.direction = 1; }
+
+        // 加上地震推力
+        this.worldX += moveIntent + shakeForce;
+
+        this.velY += this.gravity;
+        this.y += this.velY;
+
+        let onPlatform = false;
+        for (let plat of worldPlatforms) {
+            if (this.worldX + this.width > plat.x && this.worldX < plat.x + plat.width) {
+                if (this.velY >= 0 && this.y + this.height <= plat.y + 10 && this.y + this.height + this.velY >= plat.y) {
+                    this.y = plat.y - this.height;
+                    this.velY = 0;
+                    this.isJumping = false;
+                    onPlatform = true;
+                    break;
+                }
+            }
+        }
+
+        if (!onPlatform && this.y + this.height >= GROUND_Y) {
+            this.y = GROUND_Y - this.height;
+            this.velY = 0;
+            this.isJumping = false;
+        }
+
+        if (this.worldX < 0) this.worldX = 0;
+        if (this.worldX + this.width > WORLD_WIDTH) this.worldX = WORLD_WIDTH - this.width;
+
+        // 滾動鏡頭
+        if (this.worldX > canvas.width / 2) {
+            cameraX = this.worldX - canvas.width / 2;
+            if (cameraX > WORLD_WIDTH - canvas.width) cameraX = WORLD_WIDTH - canvas.width;
+        } else {
+            cameraX = 0;
+        }
+
+        // --- 場景轉換與劇情推進觸發點 ---
+        // 進入森林觸發點 (1000px)
+        if (currentStage === 1 && this.worldX >= 1000) {
+            currentStage = 2;
+            this.worldX = 1050; // 微調位置防止重複觸發
+            triggerCutscene("forest");
+        }
+        // 進入魔王戰觸發點 (2000px)
+        if (currentStage === 2 && this.worldX >= 2000) {
+            currentStage = 3;
+            this.worldX = 2050;
+            bossActive = true;
+            triggerCutscene("boss");
+        }
+
+        // 檢查陷阱碰觸
+        for (let hz of worldHazards) {
+            if (this.worldX + this.width > hz.x && this.worldX < hz.x + hz.width && this.y + this.height >= GROUND_Y - 5) {
+                gameState = "GAMEOVER";
+            }
+        }
+    },
+    jump() {
+        if (isCutscene) return;
+        if (!this.isJumping || this.velY === 0) { this.velY = this.jumpPower; this.isJumping = true; }
+    },
+    shoot() {
+        if (isCutscene || ammoSystem.isReloading || ammoSystem.currentAmmo <= 0) return;
+
+        ammoSystem.currentAmmo--;
+        bullets.push({
+            worldX: this.direction === 1 ? this.worldX + this.width : this.worldX,
+            y: this.y + 18,
+            width: 14,
+            height: 6,
+            speedX: 13 * this.direction,
+            speedY: 0,
+            type: "player",
+            color: "#f1c40f"
+        });
+
+        if (ammoSystem.currentAmmo === 0) {
+            ammoSystem.isReloading = true;
+            ammoSystem.reloadTimer = 0;
+        }
+    },
+    draw() {
+        let screenX = this.worldX - cameraX;
+        ctx.fillStyle = "#3498db"; 
+        ctx.fillRect(screenX, this.y, this.width, this.height);
+        ctx.fillStyle = "#fff";
+        let eyeX = this.direction === 1 ? screenX + 22 : screenX + 5;
+        ctx.fillRect(eyeX, this.y + 10, 8, 8);
+    }
+};
+
+// --- 2. 大魔王物件 ---
+const boss = {
+    worldX: WORLD_WIDTH - 150, 
+    y: GROUND_Y - 160,
+    width: 110,
+    height: 160,
+    hp: 15,
+    maxHp: 15,
+    speedY: 1.5,
+    skillTimer: 0,
+    currentSkillText: "狂暴形態中...",
+
+    update() {
+        if (!bossActive || isCutscene) return;
+
+        this.y += this.speedY;
+        if (this.y <= GROUND_Y - 220 || this.y >= GROUND_Y - 160) this.speedY *= -1;
+
+        this.skillTimer++;
+        if (this.skillTimer >= 80) {
+            this.useRandomSkill();
+            this.skillTimer = 0;
+        }
+    },
+    useRandomSkill() {
+        const r = Math.random();
+        if (r < 0.5) {
+            this.currentSkillText = "招式：滅絕三連火球！";
+            for(let i=0; i<3; i++) {
+                setTimeout(() => {
+                    if (gameState !== "PLAYING" || isCutscene) return;
+                    bullets.push({
+                        worldX: this.worldX,
+                        y: this.y + 30 + (i * 40),
+                        width: 18,
+                        height: 18,
+                        speedX: -8,
+                        speedY: 0,
+                        type: "boss",
+                        color: "#faa307",
+                        shape: "circle"
+                    });
+                }, i * 180);
+            }
+        } else {
+            this.currentSkillText = "狂暴：地殼核心衝擊波！";
+            bullets.push({
+                worldX: this.worldX - 20,
+                y: GROUND_Y - 80,
+                width: 55,
+                height: 80,
+                speedX: -7,
+                speedY: 0,
+                type: "boss",
+                color: "#ff4d6d",
+                shape: "rect"
+            });
+        }
+    },
+    draw() {
+        let screenX = this.worldX - cameraX;
+        ctx.fillStyle = "#7209b7"; 
+        ctx.fillRect(screenX, this.y, this.width, this.height);
+        ctx.fillStyle = "#ff0054"; 
+        ctx.fillRect(screenX + 15, this.y + 35, 30, 30);
+
+        // 魔王血條 UI
+        if (!isCutscene) {
+            const barWidth = 450;
+            const barX = (canvas.width - barWidth) / 2;
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(barX, 25, barWidth, 16);
+            ctx.fillStyle = "#ff0054";
+            ctx.fillRect(barX, 25, (this.hp / this.maxHp) * barWidth, 16);
+
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 13px 'Courier New'";
+            ctx.fillText(`🚨 BOSS: 異星暴君 核心型體 (${this.currentSkillText})`, barX, 16);
+        }
+    }
+};
+
+let bullets = [];
+let enemies = [];
+let score = 0;
+let gameState = "PLAYING"; 
+let spawnTimer = 0;
+let bossActive = false;
+
+function spawnEnemy() {
+    if (bossActive || isCutscene) return;
+    enemies.push({
+        worldX: cameraX + canvas.width + 20,
+        y: GROUND_Y - 55,
+        width: 35,
+        height: 55,
+        speed: 2.5 + Math.random() * 1.5
+    });
+}
+
+function isColliding(rect1, rect2) {
+    let r1X = rect1.worldX !== undefined ? rect1.worldX : rect1.x;
+    let r2X = rect2.worldX !== undefined ? rect2.worldX : rect2.x;
+    return r1X < r2X + rect2.width && r1X + rect1.width > r2X &&
+           rect1.y < rect2.y + rect2.height && rect1.y + rect1.height > rect2.y;
+}
+
+function resetGame() {
+    player.worldX = 60;
+    player.y = GROUND_Y - 60;
+    player.velY = 0;
+    cameraX = 0;
+    currentStage = 1;
+    bullets = [];
+    enemies = [];
+    score = 0;
+    bossActive = false;
+    boss.hp = boss.maxHp;
+    ammoSystem.currentAmmo = ammoSystem.maxAmmo;
+    ammoSystem.isReloading = false;
+    gameState = "PLAYING";
+    triggerCutscene("start");
+}
+
+// 初始化劇本
+dialogueList = dialogues.start;
+
+// --- 監聽鍵盤輸入 ---
+window.addEventListener("keydown", (e) => {
+    if (keys[e.key]) return;
+    keys[e.key] = true;
+
+    if (gameState === "PLAYING") {
+        // 劇情對話模式中的 Enter 按鍵邏輯
+        if (isCutscene && e.key === "Enter") {
+            currentDialogueIndex++;
+            if (currentDialogueIndex >= dialogueList.length) {
+                isCutscene = false; // 播完對話，關閉劇情模式，遊戲開始
+            }
+        }
+
+        if (!isCutscene) {
+            if (e.key === " ") player.jump();
+            if ((e.key === "j" || e.key === "J") && canShoot) { 
+                player.shoot(); 
+                canShoot = false; 
+            }
+        }
+    } else {
+        if (e.key === "r" || e.key === "R") resetGame();
+    }
+});
+
+window.addEventListener("keyup", (e) => {
+    keys[e.key] = false;
+    if (e.key === "j" || e.key === "J") canShoot = true;
+});
+
+// --- 主循環 ---
+function gameLoop() {
+    // 裝彈
+    if (ammoSystem.isReloading && !isCutscene) {
+        ammoSystem.reloadTimer++;
+        if (ammoSystem.reloadTimer >= ammoSystem.reloadTimeFrames) {
+            ammoSystem.currentAmmo = ammoSystem.maxAmmo;
+            ammoSystem.isReloading = false;
+        }
+    }
+
+    // 環境晃動模擬 (劇情模式下不搖晃，方便看對話)
+    if (!isCutscene && gameState === "PLAYING") {
+        shakeTimer += 0.05;
+        shakeForce = Math.sin(shakeTimer) * 2.8;
+        visualShakeX = Math.sin(shakeTimer * 2) * 4;
+    } else {
+        shakeForce = 0;
+        visualShakeX = 0;
+    }
+    canvas.style.transform = `translateX(${visualShakeX}px)`;
+
+    // 取得當前關卡色彩配置
+    let cfg = stageConfigs[currentStage];
+
+    // 清空並重繪場景背景
+    ctx.fillStyle = cfg.bgColor;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 1. 畫出安全地面
+    ctx.strokeStyle = cfg.groundColor;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(canvas.width, GROUND_Y);
+    ctx.stroke();
+
+    // 2. 畫陷阱
+    for (let hz of worldHazards) {
+        let scrX = hz.x - cameraX;
+        ctx.fillStyle = cfg.hazardColor;
+        ctx.fillRect(scrX, hz.y, hz.width, hz.height);
+    }
+
+    // 3. 畫高台
+    ctx.fillStyle = cfg.platColor;
+    for (let plat of worldPlatforms) {
+        let scrX = plat.x - cameraX;
+        ctx.fillRect(scrX, plat.y, plat.width, plat.height);
+    }
+
+    // --- 核心邏輯更新 ---
+    if (gameState === "PLAYING") {
+        player.update();
+
+        if (!bossActive && !isCutscene) {
+            spawnTimer++;
+            if (spawnTimer >= 70) { spawnEnemy(); spawnTimer = 0; }
+        } else {
+            boss.update();
+            if (isColliding(player, boss)) gameState = "GAMEOVER";
+        }
+
+        // 子彈處理
+        if (!isCutscene) {
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i];
+                b.worldX += b.speedX;
+                b.y += b.speedY;
+                let scrX = b.worldX - cameraX;
+
+                ctx.fillStyle = b.color;
+                if (b.shape === "circle") {
+                    ctx.beginPath();
+                    ctx.arc(scrX + b.width/2, b.y + b.height/2, b.width/2, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    ctx.fillRect(scrX, b.y, b.width, b.height);
+                }
+
+                if (b.type === "player") {
+                    for (let j = enemies.length - 1; j >= 0; j--) {
+                        if (isColliding(b, enemies[j])) {
+                            enemies.splice(j, 1);
+                            bullets.splice(i, 1);
+                            score += 20;
+                            break;
+                        }
+                    }
+                    if (bossActive && bullets[i] && isColliding(b, boss)) {
+                        boss.hp--;
+                        bullets.splice(i, 1);
+                        if (boss.hp <= 0) gameState = "WIN";
+                        continue;
+                    }
+                } else {
+                    if (isColliding(b, player)) gameState = "GAMEOVER";
+                }
+
+                if (scrX > canvas.width + 100 || scrX < -100) bullets.splice(i, 1);
+            }
+        }
+
+        // 小兵處理
+        if (!isCutscene) {
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                enemies[i].worldX -= enemies[i].speed;
+                let scrX = enemies[i].worldX - cameraX;
+
+                ctx.fillStyle = "#d35400"; 
+                ctx.fillRect(scrX, enemies[i].y, enemies[i].width, enemies[i].height);
+
+                if (isColliding(player, enemies[i])) gameState = "GAMEOVER";
+                if (scrX + enemies[i].width < 0) enemies.splice(i, 1);
+            }
+        }
+    }
+
+    // 繪製角色
+    player.draw();
+    if (bossActive) boss.draw();
+
+    // --- UI 顯示面 ---
+    if (!isCutscene) {
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 14px 'Courier New'";
+        ctx.fillText(cfg.name, 20, 30);
+        
+        let progress = Math.min(100, Math.floor((player.worldX / 2000) * 100));
+        if(!bossActive) ctx.fillText(`🗺️ 總戰役進度: ${progress}%`, 20, 55);
+
+        if (ammoSystem.isReloading) {
+            ctx.fillStyle = "#e74c3c"; ctx.fillText("🔋 RELOADING...", 20, 80);
+        } else {
+            ctx.fillStyle = "#f1c40f"; ctx.fillText(`💥 彈藥: ${ammoSystem.currentAmmo} / ${ammoSystem.maxAmmo}`, 20, 80);
+        }
+    }
+
+    // --- 核心功能：對話框劇場渲染 ---
+    if (isCutscene && gameState === "PLAYING") {
+        let currentDiag = dialogueList[currentDialogueIndex];
+        
+        // 對話框半透明黑底
+        ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+        ctx.fillRect(50, canvas.height - 250, canvas.width - 100, 130);
+        // 白邊框
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(50, canvas.height - 250, canvas.width - 100, 130);
+
+        // 渲染講話者名字
+        ctx.fillStyle = currentDiag.speaker === "雷霆上尉" ? "#3498db" : (currentDiag.speaker === "總部無線電" ? "#2ecc71" : "#e74c3c");
+        ctx.font = "bold 18px 'Courier New'";
+        ctx.fillText(currentDiag.speaker, 75, canvas.height - 215);
+
+        // 渲染講話內容文本
+        ctx.fillStyle = "#fff";
+        ctx.font = "15px 'Courier New'";
+        ctx.fillText(currentDiag.text, 75, canvas.height - 175);
+
+        // 右下角提示按 Enter
+        ctx.fillStyle = "#888";
+        ctx.font = "12px 'Courier New'";
+        ctx.fillText("Press [Enter] >>", canvas.width - 200, canvas.height - 140);
+    }
+
+    // 遊戲結束與勝利畫面
+    if (gameState === "GAMEOVER") {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.9)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#e74c3c"; ctx.font = "bold 40px 'Courier New'"; ctx.textAlign = "center";
+        ctx.fillText("MISSION FAILED", canvas.width / 2, canvas.height / 2 - 20);
+        ctx.fillStyle = "#fff"; ctx.font = "18px 'Courier New'";
+        ctx.fillText("Press 'R' to Restart and Try Again", canvas.width / 2, canvas.height / 2 + 30);
+        ctx.textAlign = "left";
+    }
+
+    if (gameState === "WIN") {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.9)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#2ecc71"; ctx.font = "bold 40px 'Courier New'"; ctx.textAlign = "center";
+        ctx.fillText("CAMPAIGN COMPLETE!", canvas.width / 2, canvas.height / 2 - 20);
+        ctx.fillStyle = "#f1c40f"; ctx.font = "20px 'Courier New'";
+        ctx.fillText("你成功在強震中突圍，徹底摧毀了異星暴君的核心！", canvas.width / 2, canvas.height / 2 + 30);
+        ctx.fillStyle = "#fff"; ctx.font = "16px 'Courier New'";
+        ctx.fillText("Press 'R' to Replay campaign", canvas.width / 2, canvas.height / 2 + 80);
+        ctx.textAlign = "left";
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+// 啟動開場劇情
+triggerCutscene("start");
+gameLoop();
+</script>
+
+</body>
+</html>
